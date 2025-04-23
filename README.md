@@ -10,12 +10,11 @@ Codex is a lightweight CLI tool that wraps around the Ollama GPT API to generate
 - ✅ Loading animation for non-streamed responses
 - ✅ Environment variable support for API key
 
-## 🔧 Installation
+## 📦 Installation
 
-Download the zip:
 ```bash
-unzip codex.zip
-cd codex
+git clone https://github.com/exrienz/codex-gpt.git
+cd codex-gpt
 pip install .
 ```
 
