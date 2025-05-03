@@ -10,7 +10,7 @@ from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_exception_t
 
 API_URL = "https://gpt.code-x.my/api/generate"
 DEFAULT_MODEL = "qwen2.5:3b"
-MAX_TOKENS = 512  # Rough token cap
+MAX_TOKENS = 2048
 
 class GPTAPIError(Exception):
     pass
@@ -26,13 +26,6 @@ def enforce_token_limit(prompt, max_tokens):
     if estimated_tokens > max_tokens:
         raise ValueError(f"Prompt too long: estimated {estimated_tokens} tokens > {max_tokens} limit.")
     return prompt
-
-def load_prompt_from_file(file_path):
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read().strip()
-    except Exception as e:
-        raise ValueError(f"Failed to read prompt file: {e}")
 
 def start_loading_spinner(stop_event):
     spinner = [
@@ -52,7 +45,7 @@ def start_loading_spinner(stop_event):
     stop=stop_after_attempt(3),
     retry=retry_if_exception_type((requests.exceptions.RequestException, GPTAPIError))
 )
-def call_gpt_api(model, prompt, stream=False):
+def call_gpt_api(model, prompt, stream=True):
     prompt = enforce_token_limit(prompt, MAX_TOKENS)
     auth_token = get_auth_token()
     headers = {
@@ -100,20 +93,16 @@ def call_gpt_api(model, prompt, stream=False):
 
 def main():
     parser = argparse.ArgumentParser(description="CLI wrapper for Ollama GPT API")
+    parser.add_argument("prompt", nargs=1, help="Instruction or question for the model (enclose in quotes)")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"Model name (default: {DEFAULT_MODEL})")
-    prompt_group = parser.add_mutually_exclusive_group(required=True)
-    prompt_group.add_argument("-p", "--prompt", help="Prompt text")
-    prompt_group.add_argument("-f", "--prompt-file", help="Path to a file containing the prompt")
-    parser.add_argument("--stream", action="store_true", help="Enable streaming output")
+    parser.add_argument("--complete", action="store_true", help="Wait for full completion instead of streaming")
 
     args = parser.parse_args()
 
     try:
-        if args.prompt_file:
-            prompt = load_prompt_from_file(args.prompt_file)
-        else:
-            prompt = args.prompt
-        call_gpt_api(args.model, prompt, stream=args.stream)
+        stdin_data = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+        prompt = f"{stdin_data.strip()}\n\n{args.prompt[0].strip()}" if stdin_data else args.prompt[0].strip()
+        call_gpt_api(args.model, prompt, stream=not args.complete)
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
