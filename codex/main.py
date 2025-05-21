@@ -1,132 +1,121 @@
+#!/usr/bin/env python3
+"""
+CLI wrapper for Ollama-compatible GPT API
+"""
+
+import argparse
+import json
 import os
 import sys
-import json
-import argparse
+import time
 import threading
+import signal
 import requests
-from tenacity import retry, stop_after_attempt, wait_fixed
-from signal import signal, SIGINT
+from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_exception_type
 
-# Constants
-MAX_TOKENS = 2048
 API_URL = "https://gpt.code-x.my/api/generate"
+DEFAULT_MODEL = "qwen2.5:latest"
+MAX_TOKENS = 2048
 
+class GPTAPIError(Exception):
+    pass
 
-def estimate_tokens(text: str) -> int:
-    """Rough token estimate: 1.33 tokens per word."""
-    return int(len(text.split()) * 1.33)
+def get_auth_token():
+    token = os.getenv("OLLAMA_API_KEY")
+    if not token:
+        raise EnvironmentError("Please set the OLLAMA_API_KEY environment variable.")
+    return token
 
+def enforce_token_limit(prompt, max_tokens):
+    estimated_tokens = int(len(prompt.split()) * 1.33)
+    if estimated_tokens > max_tokens:
+        raise ValueError(f"Prompt too long: estimated {estimated_tokens} tokens > {max_tokens} limit.")
+    return prompt
 
-def send_api_request(prompt: str, model: str, stream: bool):
-    """Send a request to the API with retry logic."""
-    headers = {"Authorization": f"Bearer {os.getenv('OLLAMA_API_KEY')}"}
-    payload = {"prompt": prompt, "model": model, "stream": stream}
-
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-    def _call():
-        resp = requests.post(API_URL, json=payload, headers=headers, stream=stream)
-        resp.raise_for_status()
-        return resp
-
-    return _call()
-
-
-def spinner(stop_event: threading.Event):
-    """Simple CLI spinner until stop_event is set."""
+def start_spinner(stop_event):
+    spinner = ["[ ⠋ ]", "[ ⠙ ]", "[ ⠹ ]", "[ ⠸ ]", "[ ⠼ ]", "[ ⠴ ]", "[ ⠦ ]", "[ ⠧ ]", "[ ⠇ ]", "[ ⠏ ]"]
+    idx = 0
     while not stop_event.is_set():
-        for char in '|/-\\':
-            sys.stdout.write(f"\r{char} Thinking...")
-            sys.stdout.flush()
-            if stop_event.wait(0.1):
-                break
-    sys.stdout.write("\r ")  # clear spinner
+        print(f"\r{spinner[idx % len(spinner)]} Thinking...", end="", flush=True)
+        idx += 1
+        time.sleep(0.1)
+    print("\r" + " " * 40 + "\r", end="")
 
+@retry(
+    wait=wait_fixed(2),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type((requests.exceptions.RequestException, GPTAPIError))
+)
+def send_api_request(model, prompt):
+    prompt = enforce_token_limit(prompt, MAX_TOKENS)
+    auth_token = get_auth_token()
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": model,
+        "prompt": prompt
+    }
+    response = requests.post(API_URL, headers=headers, data=json.dumps(data), stream=True)
+    if response.status_code != 200:
+        raise GPTAPIError(f"HTTP {response.status_code}: {response.text}")
+    return response
 
-def interactive_chat(model: str):
-    """Launches an interactive chat session. Press Ctrl+C to exit."""
-    print("Entering interactive chat mode. Press Ctrl+C to exit.")
+def stream_response(response):
+    for line in response.iter_lines(decode_unicode=True):
+        if line:
+            try:
+                chunk = json.loads(line)
+                print(chunk.get("response", ""), end="", flush=True)
+            except json.JSONDecodeError:
+                print(f"\n[WARN] Skipping malformed line: {line}", file=sys.stderr)
+
+def read_full_response(response):
+    stop_event = threading.Event()
+    spinner_thread = threading.Thread(target=start_spinner, args=(stop_event,))
+    spinner_thread.start()
+
+    output = ""
     try:
-        while True:
-            print()  # blank line before prompt
-            prompt = input("You: ")
-            if not prompt.strip():
-                continue
-            if estimate_tokens(prompt) > MAX_TOKENS:
-                print(f"Error: Prompt exceeds {MAX_TOKENS} token limit.")
-                continue
-            resp = send_api_request(prompt, model, stream=True)
-            for line in resp.iter_lines():
-                if line:
-                    try:
-                        chunk = json.loads(line)
-                        print(chunk.get("response", ""), end="")
-                    except json.JSONDecodeError:
-                        continue
-            print()
-    except KeyboardInterrupt:
-        print("\nExiting chat mode.")
-        sys.exit(0)
+        for line in response.iter_lines(decode_unicode=True):
+            if line:
+                try:
+                    chunk = json.loads(line)
+                    output += chunk.get("response", "")
+                except json.JSONDecodeError:
+                    print(f"\n[WARN] Skipping malformed line: {line}", file=sys.stderr)
+    finally:
+        stop_event.set()
+        spinner_thread.join()
 
+    print(output or "[INFO] No response")
+
+def signal_handler(sig, frame):
+    print("\n[INFO] Interrupted by user.")
+    sys.exit(0)
 
 def main():
-    parser = argparse.ArgumentParser(prog='codex')
-    parser.add_argument('prompt', nargs='*', help='Prompt text for completion')
-    parser.add_argument('-m', '--model', default='qwen2.5:latest', help='Model identifier')
-    parser.add_argument('--complete', action='store_true', help='Wait for full response before printing')
-    parser.add_argument('--chat', action='store_true', help='Enter interactive chat mode')
+    signal.signal(signal.SIGINT, signal_handler)
+
+    parser = argparse.ArgumentParser(description="Send a prompt to the Ollama GPT API")
+    parser.add_argument("prompt", nargs=1, help="Instruction or question for the model. If stdin is piped, it will be prepended.")
+    parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"Model to use (default: {DEFAULT_MODEL})")
+    parser.add_argument("--complete", action="store_true", help="Use non-streaming mode with spinner")
+
     args = parser.parse_args()
 
-    api_key = os.getenv('OLLAMA_API_KEY')
-    if not api_key:
-        print("Error: OLLAMA_API_KEY environment variable not set.", file=sys.stderr)
-        sys.exit(1)
-
-    if args.chat:
-        interactive_chat(args.model)
-        return
-
-    prompt_text = " ".join(args.prompt) or sys.stdin.read().strip()
-    if not prompt_text:
-        print("Error: No prompt provided.", file=sys.stderr)
-        sys.exit(1)
-
-    if estimate_tokens(prompt_text) > MAX_TOKENS:
-        print(f"Error: Prompt exceeds {MAX_TOKENS} token limit.", file=sys.stderr)
-        sys.exit(1)
-
-    stream = not args.complete
-    stop_event = threading.Event()
-
     try:
-        resp = send_api_request(prompt_text, args.model, stream=stream)
-
-        if stream:
-            for line in resp.iter_lines():
-                if line:
-                    try:
-                        chunk = json.loads(line)
-                        print(chunk.get("response", ""), end="")
-                    except json.JSONDecodeError:
-                        continue
+        stdin_data = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+        prompt_input = f"{stdin_data}\n\n{args.prompt[0].strip()}" if stdin_data else args.prompt[0].strip()
+        response = send_api_request(args.model, prompt_input)
+        if args.complete:
+            read_full_response(response)
         else:
-            spinner_thread = threading.Thread(target=spinner, args=(stop_event,))
-            spinner_thread.start()
-
-            content = ""
-            for line in resp.iter_lines():
-                if line:
-                    try:
-                        chunk = json.loads(line)
-                        content += chunk.get("response", "")
-                    except json.JSONDecodeError:
-                        continue
-            stop_event.set()
-            spinner_thread.join()
-            print(content)
+            stream_response(response)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
