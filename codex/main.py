@@ -14,7 +14,7 @@ import requests
 from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_exception_type
 
 API_URL = "https://gpt.code-x.my/api/generate"
-DEFAULT_MODEL = "qwen2.5:3b"
+DEFAULT_MODEL = "qwen2.5:latest"
 MAX_TOKENS = 2048
 
 class GPTAPIError(Exception):
